@@ -99,6 +99,22 @@ PF 1.08, MaxDD −13.0%), so its edge there is modest; the H1 result is a single
 > This is **expected**, not a bug: for a short entry, "maximum favorable" is the
 > same price move that is "maximum adverse" for a long (entry → low/entry → high).
 
+### Full OOS sanity check (same selected adaptive config, 2021-11 → 2026-06)
+
+Running the same adaptive config over the whole out-of-sample prediction stack
+(all walk-forward test folds) vs fixed A/B on the same prediction base:
+
+| Config | Trades | Return | Win% | PF | MaxDD | Sharpe |
+|---|---|---|---|---|---|---|
+| Adaptive | 781 | +18.01% | 47.12% | 1.124 | −13.01% | 0.671 |
+| A_fixed | 1,229 | −20.27% | 39.30% | 0.883 | −31.17% | −0.898 |
+| B_fixed | 355 | +29.07% | 45.07% | 1.161 | −11.13% | 0.679 |
+
+Adaptive is profitable over the full OOS period and beats fixed A, but its edge
+is thin (PF 1.12, Sharpe 0.67, MaxDD −13%) and it does **not** beat the
+high-conviction fixed B over the whole history (+29%, PF 1.16) — it only wins on
+the narrow Jan–Jun 2026 forward window.
+
 ## Honest caveats
 
 - The 6-fold model AUC (`~0.54`) is only a small edge. At 5-minute frequency,
@@ -128,6 +144,8 @@ PF 1.08, MaxDD −13.0%), so its edge there is modest; the H1 result is a single
 | `output/BTCUSDT/adaptive_2026H1.json` | Adaptive vs fixed strict-forward comparison |
 | `output/BTCUSDT/adaptive_2026H1/report.html` | Adaptive H1 backtest report |
 | `output/BTCUSDT/adaptive_2026H1/comparison.json` | Same comparison in report dir |
+| `output/BTCUSDT/adaptive_full_oos.json` | Full-OOS adaptive vs fixed A/B (2021-11 → 2026-06) |
+| `output/BTCUSDT/adaptive_2026H1/COMPARISON.md` | Human-readable comparison + full-OOS sanity check |
 
 ## Reproduce
 
