@@ -1,0 +1,15 @@
+# Virtual environment
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# Generated datasets & outputs (download via scripts/download_bnb_data.py)
+Dataset_BNBUSDT/
+output/
+*.log
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
