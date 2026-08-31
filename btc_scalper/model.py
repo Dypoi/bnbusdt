@@ -324,6 +324,178 @@ def run_walk_forward_dual(
     )
 
 
+def _train_quantile_fold(
+    Xtr: pd.DataFrame,
+    ytr: pd.Series,
+    Xva: pd.DataFrame,
+    yva: pd.Series,
+    Xte: pd.DataFrame,
+    yte: pd.Series,
+    alpha: float,
+    base_params: dict,
+    n_rounds: int,
+) -> tuple[np.ndarray, lgb.Booster]:
+    params = dict(base_params)
+    params["objective"] = "quantile"
+    params["metric"] = "quantile"
+    params["alpha"] = alpha
+    params.pop("n_estimators", None)
+    train = lgb.Dataset(Xtr, ytr)
+    valid = lgb.Dataset(Xva, yva, reference=train)
+    booster = lgb.train(
+        params,
+        train,
+        num_boost_round=max(150, n_rounds // 2),
+        valid_sets=[valid],
+        callbacks=[lgb.early_stopping(60, verbose=False), lgb.log_evaluation(0)],
+    )
+    best_iter = booster.best_iteration if booster.best_iteration and booster.best_iteration > 0 else None
+    preds = booster.predict(Xte, num_iteration=best_iter)
+    return preds.astype(float), booster
+
+
+def run_walk_forward_adaptive(
+    df: pd.DataFrame,
+    cfg,
+    long_label: str = "label_scalp_up",
+    short_label: str = "label_scalp_down",
+    mfe_alpha: float = 0.60,
+    mae_alpha: float = 0.60,
+) -> WalkForwardResult:
+    """Walk-forward adaptive model: confidence + MFE/MAE excursion.
+
+    For every fold it trains:
+    * a long/short **binary** model for confidence (P(TP before SL)),
+    * **quantile regression** models for long/short MFE and MAE.
+
+    Returned predictions contain:
+    ``prob_up``, ``prob_down``, ``mfe_long_bps``, ``mae_long_bps``,
+    ``mfe_short_bps``, ``mae_short_bps`` plus the binary targets ``y_up`` /
+    ``y_down``.
+    """
+    data = df.iloc[cfg.feature_start:].copy()
+    cols = feature_columns(data)
+    required = [long_label, short_label, "mfe_long_bps", "mae_long_bps", "mfe_short_bps", "mae_short_bps"]
+    for col in required:
+        if col not in data.columns:
+            raise ValueError(f"Missing column for adaptive model: {col}")
+    data = data.dropna(subset=required)
+    if len(data) < 5_000:
+        raise ValueError(f"Not enough labeled rows for adaptive walk-forward ({len(data)}).")
+
+    X = data[cols]
+    y_long = data[long_label].astype(float)
+    y_short = data[short_label].astype(float)
+
+    folds = _build_folds(data.index, cfg.folds, cfg.test_frac)
+    if not folds:
+        raise ValueError("Walk-forward folds could not be built; reduce folds/test_frac.")
+
+    params = dict(cfg.lgb_params)
+    n_rounds = params.pop("n_estimators", 600)
+
+    predictions = []
+    metrics = []
+    importance = []
+
+    for fold_i, (_train_start, t_test_start, t_test_end) in enumerate(folds):
+        mask_tr = data.index < t_test_start
+        mask_te = (data.index >= t_test_start) & (data.index <= t_test_end)
+        tr_idx = data.index[mask_tr]
+        te_idx = data.index[mask_te]
+        if len(tr_idx) < 2_000 or len(te_idx) < 200:
+            continue
+        n_va = max(500, int(len(tr_idx) * cfg.valid_frac))
+        va_idx = tr_idx[-n_va:]
+
+        Xtr, Xva, Xte = X.loc[tr_idx], X.loc[va_idx], X.loc[te_idx]
+        yl_tr, yl_va, yl_te = y_long.loc[tr_idx], y_long.loc[va_idx], y_long.loc[te_idx]
+        ys_tr, ys_va, ys_te = y_short.loc[tr_idx], y_short.loc[va_idx], y_short.loc[te_idx]
+
+        # ---- confidence (binary long/short) ----
+        p_up, b_up = _train_fold(Xtr, yl_tr, Xva, yl_va, Xte, yl_te, params, n_rounds)
+        p_down, b_dn = _train_fold(Xtr, ys_tr, Xva, ys_va, Xte, ys_te, params, n_rounds)
+        importance.append(pd.DataFrame({"feature": b_up.feature_name(), "gain": b_up.feature_importance("gain")}))
+        importance.append(pd.DataFrame({"feature": b_dn.feature_name(), "gain": b_dn.feature_importance("gain")}))
+
+        # ---- MFE / MAE quantile regression ----
+        reg_targets = {
+            "mfe_long_bps": data["mfe_long_bps"],
+            "mae_long_bps": data["mae_long_bps"],
+            "mfe_short_bps": data["mfe_short_bps"],
+            "mae_short_bps": data["mae_short_bps"],
+        }
+        preds_reg = {}
+        for name, col in reg_targets.items():
+            ytr = col.loc[tr_idx]
+            yva = col.loc[va_idx]
+            yte = col.loc[te_idx]
+            alpha = mfe_alpha if name.startswith("mfe_") else mae_alpha
+            p, booster = _train_quantile_fold(Xtr, ytr, Xva, yva, Xte, yte, alpha, params, n_rounds)
+            preds_reg[name] = p
+            imp = pd.DataFrame({"feature": booster.feature_name(), "gain": booster.feature_importance("gain")})
+            importance.append(imp)
+
+        auc_up = _roc_auc(yl_te.to_numpy(), p_up)
+        auc_dn = _roc_auc(ys_te.to_numpy(), p_down)
+        metrics.append(
+            {
+                "fold": fold_i + 1,
+                "test_start": str(te_idx[0]),
+                "test_end": str(te_idx[-1]),
+                "test_rows": int(len(te_idx)),
+                "base_rate_long": float(yl_te.mean()),
+                "base_rate_short": float(ys_te.mean()),
+                "auc_long": auc_up,
+                "auc_short": auc_dn,
+            }
+        )
+        predictions.append(
+            pd.DataFrame(
+                {
+                    "open_time": te_idx,
+                    "y_up": yl_te.to_numpy(),
+                    "y_down": ys_te.to_numpy(),
+                    "prob_up": p_up,
+                    "prob_down": p_down,
+                    "mfe_long_bps": preds_reg["mfe_long_bps"],
+                    "mae_long_bps": preds_reg["mae_long_bps"],
+                    "mfe_short_bps": preds_reg["mfe_short_bps"],
+                    "mae_short_bps": preds_reg["mae_short_bps"],
+                }
+            )
+        )
+
+    if not predictions:
+        raise ValueError("No folds were trained; check data size/configuration.")
+
+    preds_df = pd.concat(predictions, ignore_index=False).sort_values("open_time").reset_index(drop=True)
+    importance_avg = (
+        pd.concat(importance, ignore_index=True)
+        .groupby("feature", as_index=False)["gain"]
+        .mean()
+        .sort_values("gain", ascending=False)
+        .reset_index(drop=True)
+    )
+    aucs_long = [m["auc_long"] for m in metrics if m.get("auc_long") is not None]
+    aucs_short = [m["auc_short"] for m in metrics if m.get("auc_short") is not None]
+    aggregate = {
+        "folds": len(metrics),
+        "mean_auc": float(np.mean(aucs_long + aucs_short)) if (aucs_long + aucs_short) else None,
+        "mean_auc_long": float(np.mean(aucs_long)) if aucs_long else None,
+        "mean_auc_short": float(np.mean(aucs_short)) if aucs_short else None,
+        "mean_acc_long": float(np.mean([m["acc_long"] for m in metrics])) if "acc_long" in metrics[0] else None,
+        "mean_acc_short": float(np.mean([m["acc_short"] for m in metrics])) if "acc_short" in metrics[0] else None,
+    }
+    return WalkForwardResult(
+        predictions=preds_df,
+        metrics=metrics,
+        aggregate=aggregate,
+        feature_importance=importance_avg,
+        trained_folds=len(metrics),
+    )
+
+
 def _aggregate_metrics(fold_metrics: list[dict]) -> dict:
     aucs = [m["auc"] for m in fold_metrics if m.get("auc") is not None]
     accs = [m["acc"] for m in fold_metrics if m.get("acc") is not None]

@@ -72,6 +72,33 @@ in the ≤2025-12-31 sweep — 2026 H1 looks stronger, but with far fewer trades
 | Sharpe | 3.02 |
 | Exits | TP 11 / SL 6 |
 
+## Adaptive MFE/MAE TP/SL (new, same strict-forward basis)
+
+As a second step we built **MFE/MAE labels** (max favorable / adverse excursion,
+in basis points, over the next 12 M5 bars, using the next bar's open as entry to
+avoid same-bar look-ahead), trained **quantile-regression + directional
+confidence** models, and turned predicted MFE/MAE into a **per-bar TP/SL**:
+`tp = clip(1.0 × pred_MFE, min/max)`, `sl = clip(0.8 × pred_MAE, min/max)`,
+with an optional `atr_weight` term and an `rr_min` risk-reward filter.
+The adaptive config was swept **only on OOS predictions ≤ 2025-12-31**, then
+tested strict-forward on Jan–Jun 2026 against two fixed TP/SL baselines using
+the **same signal model**.
+
+| Config | Trades | Return | Win% | PF | MaxDD | Sharpe |
+|---|---|---|---|---|---|---|
+| **Adaptive** (0.65, cool 6, cap 1, both, tp×1.0, sl×0.8, rr≥1.0) | 27 | **+5.75%** | 62.96% | **3.22** | **−1.03%** | **3.73** |
+| A_fixed (0.60/6/1.0, 50/20) | 59 | +3.82% | 50.85% | 1.45 | −1.49% | 2.39 |
+| B_fixed (0.70/6/3.0, 50/20) | 14 | +6.85% | 64.29% | 2.57 | −2.25% | 2.77 |
+
+Adaptive H1 2026 trades: TP 12 / SL 9 / TIME 6, avg TP 64.1 bps, avg SL 26.3 bps.
+On the selection window the chosen adaptive config traded 754 times (+11.6%,
+PF 1.08, MaxDD −13.0%), so its edge there is modest; the H1 result is a single
+6-month forward sample and should be treated as one regime, not proof.
+
+> **MFE/MAE label check:** `mfe_short_bps` equals `mae_long_bps` and vice-versa.
+> This is **expected**, not a bug: for a short entry, "maximum favorable" is the
+> same price move that is "maximum adverse" for a long (entry → low/entry → high).
+
 ## Honest caveats
 
 - The 6-fold model AUC (`~0.54`) is only a small edge. At 5-minute frequency,
@@ -96,6 +123,11 @@ in the ≤2025-12-31 sweep — 2026 H1 looks stronger, but with far fewer trades
 | `output/BTCUSDT/2026H1_highconf/report.html` | High-conviction alternative |
 | `output/BTCUSDT/research_sweep.csv` | 270-config grid |
 | `output/BTCUSDT/predictions_oos.csv` | Out-of-sample predictions |
+| `output/BTCUSDT/adaptive_sweep.csv` | Adaptive TP/SL config sweep (512 configs) |
+| `output/BTCUSDT/adaptive_predictions.csv` | Adaptive MFE/MAE + confidence predictions |
+| `output/BTCUSDT/adaptive_2026H1.json` | Adaptive vs fixed strict-forward comparison |
+| `output/BTCUSDT/adaptive_2026H1/report.html` | Adaptive H1 backtest report |
+| `output/BTCUSDT/adaptive_2026H1/comparison.json` | Same comparison in report dir |
 
 ## Reproduce
 
@@ -105,4 +137,8 @@ python scripts/research_full.py --folds 6 --n-est 350 --sweep-rows 120000 --sele
 
 # same but select config on the whole OOS window (weaker, more optimistic)
 python scripts/research_full.py --folds 6 --n-est 350 --sweep-rows 120000
+
+# adaptive MFE/MAE comparison (6-fold, sweep ≤2025-12-31, strict forward 2026 H1)
+python scripts/adaptive_tp_sl.py --folds 6 --n-est 300 \
+  --select-end 2025-12-31 --start 2026-01-01 --end 2026-06-30 --min-trades-adapt 25
 ```

@@ -78,3 +78,48 @@ def add_labels(df: pd.DataFrame, cfg) -> pd.DataFrame:
     out["label_scalp_down"] = _first_touch_label(out, cfg.scalp_bars, tp_dn, sl_dn, side=-1)
 
     return out
+
+
+def add_mfe_mae_labels(df: pd.DataFrame, cfg, hold: int | None = None) -> pd.DataFrame:
+    """Add forward best/worst excursion labels (in basis points) for long/short.
+
+    Convention (entry at the *open of the next bar* to avoid same-bar look-ahead):
+    - ``mfe_long_bps``: max favorable move of a long entry over the next ``hold`` bars.
+    - ``mae_long_bps``: max adverse move of a long entry over the next ``hold`` bars.
+    - ``mfe_short_bps`` / ``mae_short_bps``: same for a short entry.
+
+    Returns
+    -------
+    DataFrame with the input plus ``mfe_*`` / ``mae_*`` bps columns.
+    """
+    hold = int(hold if hold is not None else getattr(cfg, "scalp_bars", 12))
+    out = df.copy()
+    opens = out["open"].to_numpy(dtype=float)
+    highs = out["high"].to_numpy(dtype=float)
+    lows = out["low"].to_numpy(dtype=float)
+    n = len(out)
+
+    mfe_l = np.full(n, np.nan)
+    mae_l = np.full(n, np.nan)
+    mfe_s = np.full(n, np.nan)
+    mae_s = np.full(n, np.nan)
+
+    # For each signal bar k, entry uses open[k+1] and the window is k+1..k+hold.
+    for k in range(n - 1):
+        entry_bar = k + 1
+        end = min(n - 1, k + hold)
+        if entry_bar > end:
+            continue
+        entry = opens[entry_bar]
+        hi = highs[entry_bar : end + 1]
+        lo = lows[entry_bar : end + 1]
+        mfe_l[k] = np.max((hi - entry) / entry) * 10_000.0
+        mae_l[k] = np.max((entry - lo) / entry) * 10_000.0
+        mfe_s[k] = np.max((entry - lo) / entry) * 10_000.0
+        mae_s[k] = np.max((hi - entry) / entry) * 10_000.0
+
+    out["mfe_long_bps"] = mfe_l
+    out["mae_long_bps"] = mae_l
+    out["mfe_short_bps"] = mfe_s
+    out["mae_short_bps"] = mae_s
+    return out

@@ -98,6 +98,167 @@ def _direction_at(prob_up: float, prob_down: float, thresh: float, margin: float
     return 0
 
 
+def run_backtest_dynamic(df: pd.DataFrame, predictions: pd.DataFrame, cfg) -> BacktestResult:
+    """Backtest with per-bar dynamic TP/SL (from a MFE/MAE adaptive model).
+
+    ``predictions`` must contain ``open_time``, ``prob_up``, ``prob_down`` and
+    per-bar ``tp_bps`` / ``sl_bps``. The TP/SL used by the executed trade is the
+    value at the *signal bar* (close of bar i), while entry happens on the open
+    of bar i+1 — same no-look-ahead convention as the fixed TP/SL backtester.
+    """
+    required = ["open_time", "prob_up", "prob_down", "tp_bps", "sl_bps"]
+    for c in required:
+        if c not in predictions.columns:
+            raise ValueError(f"predictions missing dynamic column: {c}")
+
+    merged = df.copy()
+    pred = predictions[required].drop_duplicates(subset="open_time").set_index("open_time")
+    merged = merged.join(pred, how="left")
+    for c in ["prob_up", "prob_down", "tp_bps", "sl_bps"]:
+        merged[c] = merged[c].fillna(0.5 if c.startswith("prob_") else getattr(cfg, "tp_bps" if c == "tp_bps" else "sl_bps"))
+
+    n = len(merged)
+    if n < 100:
+        raise ValueError("Not enough rows to backtest.")
+
+    idx = merged.index.to_numpy()
+    open_p = merged["open"].to_numpy(dtype=float)
+    high_p = merged["high"].to_numpy(dtype=float)
+    low_p = merged["low"].to_numpy(dtype=float)
+    close_p = merged["close"].to_numpy(dtype=float)
+    prob_up = merged["prob_up"].to_numpy(dtype=float)
+    prob_down = merged["prob_down"].to_numpy(dtype=float)
+    tp_bps = merged["tp_bps"].to_numpy(dtype=float)
+    sl_bps = merged["sl_bps"].to_numpy(dtype=float)
+
+    thresh = cfg.probability_threshold
+    margin = getattr(cfg, "probability_margin", 0.0)
+    cooldown = int(getattr(cfg, "cooldown_bars", 0))
+    fee = _fee_rate(cfg)
+    slip = _slippage(cfg)
+    max_hold = int(cfg.max_hold_bars)
+
+    cash = float(cfg.initial_capital)
+    next_entry_bar = 0
+    trades: list[dict] = []
+    i = 0
+
+    while i < n - 1:
+        while i < n - 1 and i < next_entry_bar:
+            i += 1
+        if i >= n - 1:
+            break
+
+        side = _direction_at(prob_up[i], prob_down[i], thresh, margin)
+        if side == 0:
+            i += 1
+            continue
+        entry_idx = i + 1
+        if entry_idx >= n:
+            break
+
+        raw_entry = float(open_p[entry_idx])
+        entry = raw_entry * (1.0 + slip) if side > 0 else raw_entry * (1.0 - slip)
+        tp_pct = max(1.0, float(tp_bps[i])) / 10_000.0
+        sl_pct = max(0.5, float(sl_bps[i])) / 10_000.0
+        if side > 0:
+            tp = entry * (1.0 + tp_pct)
+            sl = entry * (1.0 - sl_pct)
+        else:
+            tp = entry * (1.0 - tp_pct)
+            sl = entry * (1.0 + sl_pct)
+
+        sl_dist = abs(entry - sl)
+        risk_amount = cash * cfg.risk_pct
+        qty = risk_amount / max(sl_dist, 1e-12)
+        notional_cap = cash * cfg.notional_pct_cap
+        qty = min(qty, notional_cap / max(entry, 1e-12))
+        if qty <= 0:
+            i += 1
+            continue
+
+        entry_fee = qty * entry * fee
+
+        window_end = min(n - 1, entry_idx + max_hold - 1)
+        exit_j = -1
+        exit_type = 0
+        exit_price = np.nan
+        for j in range(entry_idx, window_end + 1):
+            if side > 0:
+                if low_p[j] <= sl:
+                    exit_j, exit_type, exit_price = j, -1, sl
+                    break
+                if high_p[j] >= tp:
+                    exit_j, exit_type, exit_price = j, 1, tp
+                    break
+            else:
+                if high_p[j] >= sl:
+                    exit_j, exit_type, exit_price = j, -1, sl
+                    break
+                if low_p[j] <= tp:
+                    exit_j, exit_type, exit_price = j, 1, tp
+                    break
+        if exit_j < 0:
+            exit_j = window_end
+            exit_type = 9
+            exit_price = float(close_p[window_end])
+
+        exit_price = exit_price * (1.0 - slip) if side > 0 else exit_price * (1.0 + slip)
+        exit_fee = qty * exit_price * fee
+        gross = (exit_price - entry) * qty * side
+        net = gross - entry_fee - exit_fee
+        cash += net
+        trades.append(
+            {
+                "side": "long" if side > 0 else "short",
+                "entry_time": pd.Timestamp(idx[entry_idx]),
+                "exit_time": pd.Timestamp(idx[exit_j]),
+                "entry_pos": entry_idx,
+                "exit_pos": exit_j,
+                "entry_price": entry,
+                "exit_price": exit_price,
+                "tp_bps": tp_pct * 10_000.0,
+                "sl_bps": sl_pct * 10_000.0,
+                "qty": qty,
+                "exit_type": "TP" if exit_type == 1 else ("SL" if exit_type == -1 else "TIME"),
+                "pnl_net": net,
+                "pnl_pct": net / (qty * entry) * 100.0,
+                "bars_held": exit_j - entry_idx,
+                "fees": entry_fee + exit_fee,
+                "equity_after": cash,
+            }
+        )
+        next_entry_bar = exit_j + cooldown
+        i = exit_j + 1
+
+    trades_df = pd.DataFrame(trades)
+    cash_series = np.full(n, float(cfg.initial_capital))
+    unrealized = np.zeros(n)
+    if len(trades):
+        exit_idx = np.array([t["exit_pos"] for t in trades], dtype=int)
+        pnl = np.array([t["pnl_net"] for t in trades])
+        pnl_by_bar = np.zeros(n)
+        np.add.at(pnl_by_bar, exit_idx, pnl)
+        cash_series = float(cfg.initial_capital) + np.cumsum(pnl_by_bar)
+        for t in trades:
+            entry_pos, exit_pos = int(t["entry_pos"]), int(t["exit_pos"])
+            direction = 1.0 if t["side"] == "long" else -1.0
+            seg = np.arange(entry_pos, max(entry_pos, exit_pos))
+            unrealized[seg] += (close_p[seg] - t["entry_price"]) * t["qty"] * direction
+
+    equity_vals = cash_series + unrealized
+    equity_df = pd.DataFrame({"open_time": pd.to_datetime(pd.Index(idx, name="open_time"), utc=True), "equity": equity_vals})
+    metrics = _performance_metrics(trades_df, equity_df, cfg)
+
+    if len(trades):
+        metrics["avg_tp_bps"] = float(trades_df["tp_bps"].mean())
+        metrics["avg_sl_bps"] = float(trades_df["sl_bps"].mean())
+    else:
+        metrics["avg_tp_bps"] = 0.0
+        metrics["avg_sl_bps"] = 0.0
+    return BacktestResult(trades=trades_df, equity=equity_df, metrics=metrics)
+
+
 def run_backtest(df: pd.DataFrame, predictions: pd.DataFrame, cfg) -> BacktestResult:
     """Run a trade-by-trade backtest using out-of-sample predictions.
 
