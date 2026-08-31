@@ -1,8 +1,13 @@
 # BTCUSDT 5m Research Results — January–June 2026
 
+> **Important naming note:** “H1 2026” in this document means **first half of
+> the year 2026 (January–June)**, *not* a 1-hour timeframe. The model and the
+> backtest are executed entirely on the **M5 (5-minute) candle**:
+> `interval = "5m"`, `max_hold_bars = 12 bars = 60 minutes`.
+
 Run date: 2026-08-31  
 Dataset: `Dataset_BTCUSDT/` (Binance Vision 5m, 2021-01 → 2026-06, real data)  
-Symbol / interval: **BTCUSDT / 5m**
+Symbol / interval: **BTCUSDT / M5 (5m)**
 
 ## What was run
 
