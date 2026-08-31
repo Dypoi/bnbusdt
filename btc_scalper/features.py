@@ -29,6 +29,49 @@ def _rsi(close: pd.Series, window: int) -> pd.Series:
     return out
 
 
+def _adx(high: pd.Series, low: pd.Series, close: pd.Series, window: int = 14) -> pd.Series:
+    """Wilder's ADX (directional strength), 0..100."""
+    up = high.diff()
+    down = -low.diff()
+    plus_dm = pd.Series(np.where((up > down) & (up > 0), up, 0.0), index=close.index)
+    minus_dm = pd.Series(np.where((down > up) & (down > 0), down, 0.0), index=close.index)
+    tr = pd.concat(
+        [high - low, (high - close.shift()).abs(), (low - close.shift()).abs()], axis=1
+    ).max(axis=1)
+    atr = tr.ewm(alpha=1.0 / window, adjust=False, min_periods=window).mean()
+    plus_di = 100.0 * plus_dm.ewm(alpha=1.0 / window, adjust=False, min_periods=window).mean() / atr.replace(0.0, np.nan)
+    minus_di = 100.0 * minus_dm.ewm(alpha=1.0 / window, adjust=False, min_periods=window).mean() / atr.replace(0.0, np.nan)
+    dx = 100.0 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0.0, np.nan)
+    return dx.ewm(alpha=1.0 / window, adjust=False, min_periods=window).mean()
+
+
+def _mfi(high: pd.Series, low: pd.Series, close: pd.Series, volume: pd.Series, window: int = 14) -> pd.Series:
+    """Money Flow Index, 0..100."""
+    tp = (high + low + close) / 3.0
+    mf = tp * volume
+    positive = mf.where(tp > tp.shift(), 0.0)
+    negative = mf.where(tp < tp.shift(), 0.0)
+    pos_sum = positive.rolling(window, min_periods=window // 2).sum()
+    neg_sum = negative.rolling(window, min_periods=window // 2).sum()
+    return 100.0 - 100.0 / (1.0 + pos_sum / neg_sum.replace(0.0, np.nan))
+
+
+def _rolling_rank(series: pd.Series, window: int) -> pd.Series:
+    """Fast relative position of the latest value inside a rolling window (0..1).
+
+    Min/max normalization is used instead of an exact percentile rank because
+    the exact rolling rank is prohibitively slow on 500k+ 5m bars.
+    """
+    lo = series.rolling(window, min_periods=max(2, window // 3)).min()
+    hi = series.rolling(window, min_periods=max(2, window // 3)).max()
+    return (series - lo) / (hi - lo).replace(0.0, np.nan)
+
+
+def _rolling_corr(a: pd.Series, b: pd.Series, window: int) -> pd.Series:
+    """Rolling Pearson correlation between two aligned series."""
+    return a.rolling(window, min_periods=max(3, window // 4)).corr(b)
+
+
 def add_features(df: pd.DataFrame) -> pd.DataFrame:
     """Add scalar/quant features to a Binance-style kline DataFrame.
 
@@ -129,6 +172,83 @@ def add_features(df: pd.DataFrame) -> pd.DataFrame:
 
     obv = (np.sign(close.diff()).fillna(0.0) * volume).cumsum()
     out["f_obv_slope_10"] = obv.diff(10) / obv.rolling(10, min_periods=3).std().replace(0.0, np.nan)
+
+    # ------------------------------------------------------ advanced order-flow
+    # Buy-vs-sell aggression pressure, normalized to [~-1, ~+1].
+    sell_base = volume - taker_base
+    sell_quote = quote - taker_quote
+    aggr_base = (taker_base - sell_base) / volume.replace(0.0, np.nan)
+    aggr_quote = (taker_quote - sell_quote) / quote.replace(0.0, np.nan)
+    out["f_aggr_base"] = aggr_base
+    out["f_aggr_quote"] = aggr_quote
+    for span in (5, 12):
+        out[f"f_aggr_ema_{span}"] = _ema(aggr_quote, span)
+        out[f"f_sell_ratio_ema_{span}"] = _ema(sell_quote / quote.replace(0.0, np.nan), span)
+        out[f"f_flow_quote_ema_{span}"] = _ema(out["f_flow_quote"], span)
+
+    # Cumulative (signed) delta: rolling window and full-history normalized slope.
+    cdelta = (taker_base - sell_base).cumsum()
+    for n in (20, 60):
+        cd_z = (cdelta - cdelta.rolling(n, min_periods=n // 3).mean()) / cdelta.rolling(
+            n, min_periods=n // 3
+        ).std().replace(0.0, np.nan)
+        out[f"f_cdelta_z_{n}"] = cd_z
+        out[f"f_cdelta_slope_{n}"] = cdelta.diff(n) / cdelta.rolling(n, min_periods=n // 3).std().replace(0.0, np.nan)
+
+    # Order-flow vs price divergence (is volume supporting the move?).
+    pch = close.pct_change()
+    flow_pct = out["f_flow_quote"]
+    for n in (5, 20):
+        out[f"f_flow_price_corr_{n}"] = _rolling_corr(pch, flow_pct, n)
+
+    # Execution microstructure: average trade size + trade-count momentum.
+    out["f_avg_trade"] = quote / trades.replace(0.0, np.nan)
+    out["f_avg_trade_log"] = np.log1p(out["f_avg_trade"])
+    for n in (10, 30):
+        avg_ts = out["f_avg_trade"]
+        out[f"f_avg_trade_ratio_{n}"] = avg_ts / avg_ts.rolling(n, min_periods=n // 3).mean()
+        out[f"f_trade_log_z_{n}"] = (np.log1p(trades) - np.log1p(trades).rolling(n, min_periods=n // 3).mean()) / np.log1p(trades).rolling(n, min_periods=n // 3).std().replace(0.0, np.nan)
+
+    # Liquidity / participation regimes.
+    for n in (20, 60):
+        out[f"f_volume_rank_{n}"] = _rolling_rank(volume, n)
+        out[f"f_quote_rank_{n}"] = _rolling_rank(quote, n)
+        out[f"f_trades_rank_{n}"] = _rolling_rank(trades, n)
+        out[f"f_vol_z_{n}"] = (volume - volume.rolling(n, min_periods=n // 3).mean()) / volume.rolling(n, min_periods=n // 3).std().replace(0.0, np.nan)
+
+    # ------------------------------------------------------------ regime features
+    # Volatility regime (rolling percentile) and range expansion/contraction.
+    for n in (30, 60):
+        rvol = close.pct_change().rolling(n, min_periods=n // 3).std()
+        out[f"f_rvol_rank_{n}"] = _rolling_rank(rvol.fillna(0.0), n)
+        out[f"f_atr_rank_{n}"] = _rolling_rank(true_range.fillna(0.0), n)
+    ravg = true_range.rolling(20, min_periods=5).mean()
+    out["f_range_expand"] = true_range / ravg.replace(0.0, np.nan)
+    out["f_range_expand_60"] = true_range / true_range.rolling(60, min_periods=10).mean().replace(0.0, np.nan)
+
+    # Trend strength / regime.
+    adx = _adx(high, low, close, 14)
+    out["f_adx_14"] = adx
+    out["f_di_plus_14"] = 100.0 * (high.diff().clip(lower=0.0)).ewm(alpha=1 / 14, adjust=False).mean() / true_range.ewm(alpha=1 / 14, adjust=False).mean().replace(0.0, np.nan)
+    out["f_di_minus_14"] = 100.0 * (-low.diff().clip(lower=0.0)).ewm(alpha=1 / 14, adjust=False).mean() / true_range.ewm(alpha=1 / 14, adjust=False).mean().replace(0.0, np.nan)
+    out["f_dx_44"] = _adx(high, low, close, 44)
+
+    # Donchian channel position (normalized inside the N-bar range).
+    for n in (20, 60):
+        rng_hi = high.rolling(n, min_periods=n // 3).max()
+        rng_lo = low.rolling(n, min_periods=n // 3).min()
+        spread = (rng_hi - rng_lo).replace(0.0, np.nan)
+        out[f"f_donchian_pos_{n}"] = (close - rng_lo) / spread
+
+    # Money-flow style measures.
+    mfi14 = _mfi(high, low, close, volume, 14)
+    out["f_mfi_14"] = mfi14
+    out["f_cmf_20"] = ((close - low) - (high - close)) / (high - low).replace(0.0, np.nan) * volume
+    out["f_cmf_z_20"] = (out["f_cmf_20"] - out["f_cmf_20"].rolling(20, min_periods=5).mean()) / out["f_cmf_20"].rolling(20, min_periods=5).std().replace(0.0, np.nan)
+
+    # Wick balance (continuous): positive = more lower-wick (buyer support).
+    out["f_wick_skew"] = (out["f_lower_wick"] - out["f_upper_wick"]) / rng
+    out["f_wick_skew_ema"] = _ema(out["f_wick_skew"], 12)
 
     # ------------------------------------------------------------ trend context
     out["f_hi_shr"] = high.rolling(20, min_periods=5).max() / close - 1.0

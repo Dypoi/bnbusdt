@@ -49,10 +49,13 @@ Reports land in `output/BTCUSDT/`:
    quote volume, trades, taker buy volume/quote). Timestamps are normalized to
    milliseconds UTC (Binance Vision changed to microseconds in newer years; the
    parser handles both).
-2. **Features** – momentum, rolling/EMA distances, RSI, MACD, ATR/NATR,
-   candle shape, wick fractions, volume ratios, taker flow imbalance, OBV slope,
-   trend context and UTC session features. All features are strictly
-   backward-looking, so they contain no leakage.
+2. **Features (112 total)** – momentum, rolling/EMA distances, RSI, MACD,
+   ATR/NATR, candle shape, wick fractions, volume ratios, taker flow imbalance,
+   OBV slope, trend context, UTC session features **plus an advanced
+   order-flow/regime block**: taker-aggression pressure, cumulative delta,
+   flow-vs-price correlation, average trade size, volume/quote rank, volatility
+   rank, ADX/DX, Donchian position, CMF, MFI and wick skew. All features are
+   strictly backward-looking, so they contain no leakage.
 3. **Labels** –
    - `label_up` / `label_down`: next-bar direction (the main target),
    - `label_scalp_up` / `label_scalp_down`: resolved TP/SL outcome within
@@ -103,7 +106,8 @@ btc_scalper/
 ├── evaluate.py      # plots + HTML/JSON report
 └── pipeline.py      # end-to-end orchestration
 scripts/download_binance_data.py
-scripts/experiment.py
+scripts/experiment.py        # quick parameter sweep (one training run)
+scripts/research_full.py     # 6-fold walk-forward + 270-config sweep + 2026H1 report
 main.py              # CLI entry point
 requirements.txt
 Dataset_BTCUSDT/     # real BTCUSDT Binance Vision monthly archives
@@ -160,6 +164,14 @@ between pure ML metrics and a cost-aware live-ready backtest. The useful next
 steps are finding higher-conviction subsets (higher threshold/margin), better
 features/labels, cheaper execution assumptions, or a higher TP/SL regime that
 fits the noise level of 5-minute BTC bars.
+
+With the added order-flow/regime features and the strict forward protocol
+(select config on data ≤ 2025-12-31, then test Jan–Jun 2026), the research run
+produced a **modestly positive** 2026 H1 backtest:
+`+3.82%`, `59 trades`, `PF 1.45`, `MaxDD −1.48%`, `Sharpe 2.38`.
+See `RESEARCH_2026H1.md` for the full details, alternative high-conviction
+scenario, and the honest caveats (the same config is negative across the whole
+2021–2026 OOS history, so it is regime-dependent).
 
 ---
 

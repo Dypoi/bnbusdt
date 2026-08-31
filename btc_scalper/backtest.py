@@ -90,15 +90,28 @@ def _check_exit(obar: pd.Series, pos: dict, cfg) -> tuple[int, float]:
     return 0, np.nan
 
 
+def _direction_at(prob_up: float, prob_down: float, thresh: float, margin: float) -> int:
+    if prob_up >= thresh and (prob_up - prob_down) >= margin:
+        return 1
+    if prob_down >= thresh and (prob_down - prob_up) >= margin:
+        return -1
+    return 0
+
+
 def run_backtest(df: pd.DataFrame, predictions: pd.DataFrame, cfg) -> BacktestResult:
     """Run a trade-by-trade backtest using out-of-sample predictions.
 
-    Parameters
-    ----------
-    df : full kline + feature frame indexed by ``open_time``.
-    predictions : DataFrame with ``open_time``, ``prob_up``, ``prob_down``.
+    The core simulation is written with numpy arrays and a trade loop (only
+    trades are iterated, not every bar), which keeps the detailed parameter
+    sweep fast while preserving the execution rules:
+
+    - signal on close of bar ``t``, entry on the open of bar ``t+1``,
+    - taker fees + per-side slippage,
+    - TP/SL checked per bar with conservative SL-first ordering,
+    - time-stop at ``max_hold_bars``,
+    - ``cooldown`` bars between an exit and the next entry.
     """
-    if "prob_up" not in predictions.columns:
+    if "prob_up" not in predictions.columns or "prob_down" not in predictions.columns:
         raise ValueError("predictions must contain prob_up / prob_down columns")
 
     merged = df.copy()
@@ -112,101 +125,147 @@ def run_backtest(df: pd.DataFrame, predictions: pd.DataFrame, cfg) -> BacktestRe
     if n < 100:
         raise ValueError("Not enough rows to backtest.")
 
+    idx = merged.index.to_numpy()
+    open_p = merged["open"].to_numpy(dtype=float)
+    high_p = merged["high"].to_numpy(dtype=float)
+    low_p = merged["low"].to_numpy(dtype=float)
+    close_p = merged["close"].to_numpy(dtype=float)
+    prob_up = merged["prob_up"].to_numpy(dtype=float)
+    prob_down = merged["prob_down"].to_numpy(dtype=float)
+
     thresh = cfg.probability_threshold
     margin = getattr(cfg, "probability_margin", 0.0)
-    cooldown = getattr(cfg, "cooldown_bars", 0)
-    cash = cfg.initial_capital
-    pos = None
+    cooldown = int(getattr(cfg, "cooldown_bars", 0))
+    fee = _fee_rate(cfg)
+    slip = _slippage(cfg)
+    max_hold = int(cfg.max_hold_bars)
+    tp_pct = cfg.tp_bps / 10_000.0
+    sl_pct = cfg.sl_bps / 10_000.0
+
+    cash = float(cfg.initial_capital)
     next_entry_bar = 0
     trades: list[dict] = []
-    eq_points: list[dict] = []
+    i = 0
 
-    for k in range(n - 1):
-        bar = merged.iloc[k]
+    while i < n - 1:
+        # Find the next eligible signal bar.
+        while i < n - 1 and i < next_entry_bar:
+            i += 1
+        if i >= n - 1:
+            break
 
-        # ---- 1. Manage an existing position on bar k ----------------------
-        if pos is not None:
-            exit_type, exit_price = _check_exit(bar, pos, cfg)
-            exit_fee = 0.0
-            if exit_type == 0 and pos["bars_remaining"] > 0:
-                pos["bars_remaining"] -= 1
-            elif exit_type == 0:  # time stop at the close
-                exit_type = 9
-                exit_price = float(bar["close"])
-            if exit_type != 0:
-                slip = _slippage(cfg)
-                exit_price = exit_price * (1.0 - slip) if pos["side"] > 0 else exit_price * (1.0 + slip)
-                exit_fee = pos["qty"] * exit_price * _fee_rate(cfg)
-                direction = pos["side"]
-                gross = (exit_price - pos["entry"]) * pos["qty"] * direction
-                net = gross - pos["entry_fee"] - exit_fee
-                cash += net
-                trades.append(
-                    {
-                        "side": "long" if direction > 0 else "short",
-                        "entry_time": pos["entry_time"],
-                        "exit_time": bar.name,
-                        "entry_price": pos["entry"],
-                        "exit_price": exit_price,
-                        "qty": pos["qty"],
-                        "exit_type": "TP" if exit_type == 1 else ("SL" if exit_type == -1 else "TIME"),
-                        "pnl_net": net,
-                        "pnl_pct": net / (pos["qty"] * pos["entry"]) * 100.0,
-                        "bars_held": int((bar.name - pos["entry_time"]) // pd.Timedelta(minutes=5)),
-                        "fees": pos["entry_fee"] + exit_fee,
-                        "equity_after": cash,
-                    }
-                )
-                # Wait ``cooldown`` bars before re-entering on a fresh signal.
-                next_entry_bar = k + cooldown
-                pos = None
+        side = _direction_at(prob_up[i], prob_down[i], thresh, margin)
+        if side == 0:
+            i += 1
+            continue
 
-        # ---- 2. Open a new position on the next bar open ------------------
-        if pos is None and k >= next_entry_bar and k + 1 < n:
-            p_up = float(bar["prob_up"])
-            p_down = float(bar["prob_down"])
-            side = 0
-            if p_up >= thresh and (p_up - p_down) >= margin:
-                side = 1
-            elif p_down >= thresh and (p_down - p_up) >= margin:
-                side = -1
-            if side != 0:
-                pos = _open_position(merged, k + 1, side, cash, cfg)
+        entry_idx = i + 1
+        if entry_idx >= n:
+            break
 
-        # Record marked-to-market equity snapshot at the close of bar k.
-        unrealized = 0.0
-        if pos is not None:
-            mark = float(bar["close"])
-            unrealized = (mark - pos["entry"]) * pos["qty"] * pos["side"]
-        eq_points.append({"open_time": bar.name, "equity": cash + unrealized})
+        raw_entry = float(open_p[entry_idx])
+        entry = raw_entry * (1.0 + slip) if side > 0 else raw_entry * (1.0 - slip)
+        if side > 0:
+            tp = entry * (1.0 + tp_pct)
+            sl = entry * (1.0 - sl_pct)
+            sl_dist = entry - sl
+        else:
+            tp = entry * (1.0 - tp_pct)
+            sl = entry * (1.0 + sl_pct)
+            sl_dist = sl - entry
 
-    # Close any dangling position on the last bar.
-    if pos is not None:
-        bar = merged.iloc[n - 1]
-        exit_price = float(bar["close"]) * (1.0 - _slippage(cfg)) if pos["side"] > 0 else float(bar["close"]) * (1.0 + _slippage(cfg))
-        exit_fee = pos["qty"] * exit_price * _fee_rate(cfg)
-        gross = (exit_price - pos["entry"]) * pos["qty"] * pos["side"]
-        net = gross - pos["entry_fee"] - exit_fee
+        risk_amount = cash * cfg.risk_pct
+        qty = risk_amount / max(sl_dist, 1e-12)
+        notional_cap = cash * cfg.notional_pct_cap
+        qty = min(qty, notional_cap / max(entry, 1e-12))
+        if qty <= 0:
+            i += 1
+            continue
+
+        entry_fee = qty * entry * fee
+
+        # Find exit within the holding window.
+        window_end = min(n - 1, entry_idx + max_hold - 1)
+        exit_j = -1
+        exit_type = 0
+        exit_price = np.nan
+        for j in range(entry_idx, window_end + 1):
+            if side > 0:
+                if low_p[j] <= sl:
+                    exit_j, exit_type, exit_price = j, -1, sl
+                    break
+                if high_p[j] >= tp:
+                    exit_j, exit_type, exit_price = j, 1, tp
+                    break
+            else:
+                if high_p[j] >= sl:
+                    exit_j, exit_type, exit_price = j, -1, sl
+                    break
+                if low_p[j] <= tp:
+                    exit_j, exit_type, exit_price = j, 1, tp
+                    break
+        if exit_j < 0:
+            exit_j = window_end
+            exit_type = 9
+            exit_price = float(close_p[window_end])
+
+        if side > 0:
+            exit_price = exit_price * (1.0 - slip)
+        else:
+            exit_price = exit_price * (1.0 + slip)
+        exit_fee = qty * exit_price * fee
+        gross = (exit_price - entry) * qty * side
+        net = gross - entry_fee - exit_fee
         cash += net
+
+        type_label = "TP" if exit_type == 1 else ("SL" if exit_type == -1 else "TIME")
         trades.append(
             {
-                "side": "long" if pos["side"] > 0 else "short",
-                "entry_time": pos["entry_time"],
-                "exit_time": bar.name,
-                "entry_price": pos["entry"],
+                "side": "long" if side > 0 else "short",
+                "entry_time": pd.Timestamp(idx[entry_idx]),
+                "exit_time": pd.Timestamp(idx[exit_j]),
+                "entry_pos": entry_idx,
+                "exit_pos": exit_j,
+                "entry_price": entry,
                 "exit_price": exit_price,
-                "qty": pos["qty"],
-                "exit_type": "END",
+                "qty": qty,
+                "exit_type": type_label,
                 "pnl_net": net,
-                "pnl_pct": net / (pos["qty"] * pos["entry"]) * 100.0,
-                "bars_held": int((bar.name - pos["entry_time"]) // pd.Timedelta(minutes=5)),
-                "fees": pos["entry_fee"] + exit_fee,
+                "pnl_pct": net / (qty * entry) * 100.0,
+                "bars_held": exit_j - entry_idx,
+                "fees": entry_fee + exit_fee,
                 "equity_after": cash,
             }
         )
 
+        next_entry_bar = exit_j + cooldown
+        i = exit_j + 1
+
     trades_df = pd.DataFrame(trades)
-    equity_df = pd.DataFrame(eq_points)
+
+    # Build marked-to-market equity per bar.
+    cash_series = np.full(n, float(cfg.initial_capital))
+    unrealized = np.zeros(n)
+    if len(trades):
+        exit_idx = np.array([t["exit_pos"] for t in trades], dtype=int)
+        pnl = np.array([t["pnl_net"] for t in trades])
+        pnl_by_bar = np.zeros(n)
+        np.add.at(pnl_by_bar, exit_idx, pnl)
+        cash_series = float(cfg.initial_capital) + np.cumsum(pnl_by_bar)
+        for t in trades:
+            entry_pos = int(t["entry_pos"])
+            exit_pos = int(t["exit_pos"])
+            direction = 1.0 if t["side"] == "long" else -1.0
+            qty_t = t["qty"]
+            entry_t = t["entry_price"]
+            end = max(entry_pos, exit_pos)
+            segment = np.arange(entry_pos, end)
+            unrealized[segment] += (close_p[segment] - entry_t) * qty_t * direction
+
+    equity_vals = cash_series + unrealized
+    equity_df = pd.DataFrame({"open_time": pd.Index(idx, name="open_time"), "equity": equity_vals})
+    equity_df["open_time"] = pd.to_datetime(equity_df["open_time"], utc=True)
+
     metrics = _performance_metrics(trades_df, equity_df, cfg)
     return BacktestResult(trades=trades_df, equity=equity_df, metrics=metrics)
 
@@ -227,7 +286,11 @@ def _performance_metrics(trades: pd.DataFrame, equity: pd.DataFrame, cfg) -> dic
             "profit_factor": 0.0,
             "max_drawdown": 0.0,
             "sharpe": 0.0,
+            "sortino": 0.0,
             "avg_trade_pnl": 0.0,
+            "avg_bars_held": 0.0,
+            "fees_total": 0.0,
+            "exit_type_counts": {},
         }
 
     gains = trades.loc[trades["pnl_net"] > 0, "pnl_net"].sum()
