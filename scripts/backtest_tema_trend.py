@@ -100,8 +100,15 @@ def completed_4h_series(m5: pd.DataFrame, period: int) -> tuple[pd.Series, pd.Se
 
 def run_tema_backtest(df: pd.DataFrame, start: str, end: str,
                       risk_pct: float, qty_mult: float, notional_cap: float | None,
+                      adx_threshold: float = 40.0, cmo_threshold: float = 40.0,
+                      tp_ratio: float | None = None, sl_atr: float = 4.0,
                       ) -> tuple[dict, pd.DataFrame]:
-    """Run the TEMA trend-following strategy inside [start, end]."""
+    """Run the TEMA trend-following strategy inside [start, end].
+
+    ``tp_ratio`` = TP_distance / SL_distance. When ``None`` the original
+    as-authored ratio is used (TP 3 ATR / SL 4 ATR, i.e. 0.75). When set, SL is
+    ``sl_atr * ATR`` and TP is ``tp_ratio * SL``.
+    """
     data = df.loc[pd.Timestamp(start, tz="UTC"):pd.Timestamp(end, tz="UTC")].copy()
     if len(data) == 0:
         raise ValueError("No rows in test window")
@@ -115,8 +122,8 @@ def run_tema_backtest(df: pd.DataFrame, start: str, end: str,
 
     short_trend = np.where(tema10 > tema80, 1, -1)
     long_trend = np.where(tema20_4h > tema70_4h, 1, -1)
-    should_long = (short_trend == 1) & (long_trend == 1) & (adx > 40) & (cmo14 > 40)
-    should_short = (short_trend == -1) & (long_trend == -1) & (adx > 40) & (cmo14 < -40)
+    should_long = (short_trend == 1) & (long_trend == 1) & (adx > adx_threshold) & (cmo14 > cmo_threshold)
+    should_short = (short_trend == -1) & (long_trend == -1) & (adx > adx_threshold) & (cmo14 < -cmo_threshold)
 
     idx = data.index.to_numpy()
     open_p = data["open"].to_numpy(float)
@@ -133,6 +140,9 @@ def run_tema_backtest(df: pd.DataFrame, start: str, end: str,
     next_signal = 0
     n_signals_long = 0
     n_signals_short = 0
+    n_signals_skipped = 0
+    n_both_hit_bars = 0
+    max_notional_equity = 0.0
 
     i = 0
     while i < n - 1:
@@ -170,22 +180,29 @@ def run_tema_backtest(df: pd.DataFrame, start: str, end: str,
             i += 1
             continue
         entry_atr = float(atr_p[j])
-        if side > 0:
-            sl_price = entry_price - 4.0 * entry_atr
-            tp_price = entry_price + 3.0 * entry_atr
+        if tp_ratio is None:
+            sl_dist = 4.0 * entry_atr
+            tp_dist = 3.0 * entry_atr
         else:
-            sl_price = entry_price + 4.0 * entry_atr
-            tp_price = entry_price - 3.0 * entry_atr
+            sl_dist = sl_atr * entry_atr
+            tp_dist = sl_atr * tp_ratio * entry_atr
+        if side > 0:
+            sl_price = entry_price - sl_dist
+            tp_price = entry_price + tp_dist
+        else:
+            sl_price = entry_price + sl_dist
+            tp_price = entry_price - tp_dist
 
-        sl_dist = abs(entry_price - sl_price)
         risk_amount = cash * risk_pct
         qty = risk_amount / max(sl_dist, 1e-12)
         qty *= qty_mult
         if notional_cap is not None:
             qty = min(qty, (cash * notional_cap) / max(entry_price, 1e-12))
         if qty <= 0:
+            n_signals_skipped += 1
             i += 1
             continue
+        max_notional_equity = max(max_notional_equity, qty * entry_price / max(cash, 1e-12))
 
         # scan forward for TP/SL (no time-stop)
         exit_j = -1
@@ -193,6 +210,8 @@ def run_tema_backtest(df: pd.DataFrame, start: str, end: str,
         exit_price = np.nan
         for b in range(j + 1, n):
             if side > 0:
+                both = bool(low_p[b] <= sl_price and high_p[b] >= tp_price)
+                n_both_hit_bars += int(both)
                 if low_p[b] <= sl_price:
                     exit_j, exit_type, exit_price = b, -1, sl_price
                     break
@@ -200,6 +219,8 @@ def run_tema_backtest(df: pd.DataFrame, start: str, end: str,
                     exit_j, exit_type, exit_price = b, 1, tp_price
                     break
             else:
+                both = bool(high_p[b] >= sl_price and low_p[b] <= tp_price)
+                n_both_hit_bars += int(both)
                 if high_p[b] >= sl_price:
                     exit_j, exit_type, exit_price = b, -1, sl_price
                     break
@@ -232,6 +253,8 @@ def run_tema_backtest(df: pd.DataFrame, start: str, end: str,
             "exit_price": exit_price,
             "sl_price": sl_price,
             "tp_price": tp_price,
+            "sl_dist_bps": sl_dist / entry_price * 10_000.0,
+            "tp_dist_bps": tp_dist / entry_price * 10_000.0,
             "atr_entry_bps": entry_atr / entry_price * 10_000.0,
             "entry_gap_bps": abs(entry_price - close_p[i]) / close_p[i] * 10_000.0,
             "qty": qty,
@@ -266,6 +289,53 @@ def run_tema_backtest(df: pd.DataFrame, start: str, end: str,
 
     equity = pd.DataFrame({"open_time": idx, "equity": equity_vals + unrealized})
     metrics = _metrics(trades_df, equity)
+    # Forensic / sensitivity diagnostics (not all are "performance").
+    metrics["n_signals_long"] = n_signals_long
+    metrics["n_signals_short"] = n_signals_short
+    metrics["n_signals_total"] = n_signals_long + n_signals_short
+    metrics["n_cancelled_entries"] = metrics["n_signals_total"] - len(trades) - n_signals_skipped
+    metrics["fill_rate_pct"] = (len(trades) / metrics["n_signals_total"] * 100.0) if metrics["n_signals_total"] else 0.0
+    metrics["n_both_hit_bars"] = n_both_hit_bars
+    metrics["max_notional_equity"] = round(max_notional_equity, 3)
+    metrics["avg_signals_per_day"] = round(metrics["n_signals_total"] / (len(data) / 288.0), 2)
+    if len(trades_df):
+        gains = trades_df.loc[trades_df["pnl_net"] > 0, "pnl_net"]
+        losses = trades_df.loc[trades_df["pnl_net"] <= 0, "pnl_net"]
+        avg_win = float(gains.mean()) if len(gains) else 0.0
+        avg_loss = float(losses.mean()) if len(losses) else 0.0  # negative
+        metrics["avg_win"] = round(avg_win, 2)
+        metrics["avg_loss"] = round(avg_loss, 2)
+        metrics["payoff_ratio"] = round(avg_win / abs(avg_loss), 3) if abs(avg_loss) > 0 else None
+        metrics["actual_tp_sl_ratio"] = round(float(trades_df["tp_dist_bps"].mean()) / float(trades_df["sl_dist_bps"].mean()), 3) if trades_df["sl_dist_bps"].mean() > 0 else None
+        # Breakeven win rate for actual average distances (before costs).
+        be = float(trades_df["sl_dist_bps"].mean()) / (float(trades_df["sl_dist_bps"].mean()) + float(trades_df["tp_dist_bps"].mean()))
+        metrics["breakeven_win_rate_pct"] = round(be * 100.0, 2)
+        metrics["edge_vs_breakeven_pp"] = round(float((trades_df["pnl_net"] > 0).mean() * 100.0) - be * 100.0, 2)
+        # Statistical t-stat on per-trade PnL (i.i.d. approximation).
+        sd = float(trades_df["pnl_net"].std(ddof=1))
+        se = sd / np.sqrt(len(trades_df)) if sd > 0 else 0.0
+        metrics["t_stat_avg_pnl"] = round(float(trades_df["pnl_net"].mean()) / se, 2) if se > 0 else 0.0
+        # Fee burden.
+        gross = float(abs(trades_df["pnl_net"]).sum())
+        metrics["fees_pct_of_abs_pnl"] = round(float(trades_df["fees"].sum()) / gross * 100.0, 1) if gross > 0 else None
+        metrics["fees_pct_of_initial_capital"] = round(float(trades_df["fees"].sum()) / INITIAL_CAPITAL * 100.0, 2)
+        metrics["cost_per_trade_pct_capital"] = round(float(trades_df["fees"].mean()) / INITIAL_CAPITAL * 100.0, 3)
+        # Monte-Carlo bootstrap on trade PnL (i.i.d. *resample with replacement*,
+        # 500 paths). This is a distribution of the total realised PnL (not an
+        # equity-curve permutation), useful only as a rough significance check.
+        rng = np.random.default_rng(42)
+        pnl_arr = trades_df["pnl_net"].to_numpy()
+        finals = []
+        for _ in range(500):
+            sample = rng.choice(pnl_arr, size=len(pnl_arr), replace=True)
+            finals.append((INITIAL_CAPITAL + float(sample.sum())) / INITIAL_CAPITAL - 1.0)
+        metrics["bootstrap_return_5th"] = round(float(np.percentile(finals, 5)) * 100.0, 2)
+        metrics["bootstrap_return_50th"] = round(float(np.percentile(finals, 50)) * 100.0, 2)
+        metrics["bootstrap_return_95th"] = round(float(np.percentile(finals, 95)) * 100.0, 2)
+        metrics["max_consecutive_losses"] = int((trades_df["pnl_net"] <= 0).astype(int).groupby(
+            (trades_df["pnl_net"] > 0).cumsum()).cumsum().max()) if len(trades_df) else 0
+        metrics["worst_trade"] = round(float(trades_df["pnl_net"].min()), 2)
+        metrics["best_trade"] = round(float(trades_df["pnl_net"].max()), 2)
 
     return metrics, trades_df
 

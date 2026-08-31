@@ -139,6 +139,22 @@ breakeven for a 3:4 TP:SL ratio, so the edge does not survive M5 fees. It is
 also a fair test despite the falling market: it traded more shorts (76) than longs (57).
 See `output/BTCUSDT/COMPARISON_2026H1.html` / `.md`.
 
+## TEMA sensitivity + forensic audit (5m & 15m, H1 2026)
+
+A 36-config sweep (timeframe 5m/15m × ADX 25/30 × CMO 20/30 × TP:SL 1.5/2.0/3.0
+× sizing normalised/as-authored) plus a forensic audit produced:
+
+- **Only 1 of 18 normalised configs was profitable** (median normalised return −8.14%).
+  That one is NOT the requested 2:1 — it is the original 15m TEMA (TP/SL = 3:4,
+  ADX>40, CMO>±40): +2.30%, PF 1.135, MaxDD −8.30%, but **t-stat 0.41** and
+  bootstrap 5th percentile −7.83% → not statistically significant.
+- **All TP:SL 2:1 configs on 15m were negative** (best normalised −10.53%,
+  worst −25.54%; authored much worse due to leverage). Reason: 2:1 needs 33.33%
+  breakeven win-rate, but actual win-rate only 25.7%–31.3%.
+- No-lookahead checks passed (indicator prefix recomputation = 0 diff; 4h TEMA
+  used only completed 4h candles). Audit is documented in
+  `output/BTCUSDT/tema_sensitivity_2026H1/AUDIT.html` / `.md`.
+
 ## Honest caveats
 
 - The 6-fold model AUC (`~0.54`) is only a small edge. At 5-minute frequency,
@@ -173,6 +189,8 @@ See `output/BTCUSDT/COMPARISON_2026H1.html` / `.md`.
 | `output/BTCUSDT/COMPARISON_2026H1.html` / `.md` | Full H1 2026 comparison incl. Jesse TEMA strategy |
 | `output/BTCUSDT/tema_trend_2026H1/report.json` | TEMA as-authored + normalised results |
 | `output/BTCUSDT/tema_trend_2026H1/trades_*.csv` | TEMA trade logs |
+| `output/BTCUSDT/tema_sensitivity_2026H1/AUDIT.html` / `.md` | TEMA sensitivity + forensic audit |
+| `output/BTCUSDT/tema_sensitivity_2026H1/sensitivity_grid.csv` | 36-config sweep |
 
 ## Reproduce
 
@@ -189,4 +207,7 @@ python scripts/adaptive_tp_sl.py --folds 6 --n-est 300 \
 
 # Jesse TEMA trend-following comparison (H1 2026, as-authored + normalised)
 python scripts/backtest_tema_trend.py
+
+# TEMA sensitivity + forensic audit (ADX/CMO/TP:SL grid, 5m & 15m)
+python scripts/tema_sensitivity.py
 ```
