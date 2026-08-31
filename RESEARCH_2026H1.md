@@ -115,6 +115,30 @@ is thin (PF 1.12, Sharpe 0.67, MaxDD −13%) and it does **not** beat the
 high-conviction fixed B over the whole history (+29%, PF 1.16) — it only wins on
 the narrow Jan–Jun 2026 forward window.
 
+## Jesse TEMA Trend-Following comparison (Jan–Jun 2026)
+
+We also replicated the user's provided Jesse `TemaTrendFollowing` strategy on the
+same M5 data/window: limit entry 1 ATR from signal close (valid one bar),
+SL 4 ATR / TP 3 ATR (fill-bar ATR), no time-stop, ADX>40 + CMO(±40) + TEMA(10/80)
+on M5 + TEMA(20/70) on the last-completed 4h candle.
+
+Market context: BTC was **−31.23%** over Jan–Jun 2026 (buy & hold).
+
+| Strategy | Trades | Return | Win% | PF | MaxDD | Sharpe |
+|---|---|---|---|---|---|---|
+| TEMA as-authored (risk 3% ×3) | 133 | −71.91% | 58.65% | 0.84 | −84.26% | −1.28 |
+| TEMA normalised (risk 1%, 1×) | 133 | −0.92% | 58.65% | 0.98 | −10.16% | −0.10 |
+| Adaptive MFE/MAE | 27 | +5.75% | 62.96% | 3.22 | −1.03% | 3.73 |
+| A_fixed | 59 | +3.82% | 50.85% | 1.45 | −1.49% | 2.39 |
+| B_fixed | 14 | +6.85% | 64.29% | 2.57 | −2.25% | 2.77 |
+
+The TEMA strategy is **not profitable** here: as-authored the `qty*3` + 3% risk
+creates ~8–13× notional and wipes the account (−71.9%); even at normalised risk
+it only reaches −0.92% (PF 0.98). Its 58.65% win rate is just above the ~57.1%
+breakeven for a 3:4 TP:SL ratio, so the edge does not survive M5 fees. It is
+also a fair test despite the falling market: it traded more shorts (76) than longs (57).
+See `output/BTCUSDT/COMPARISON_2026H1.html` / `.md`.
+
 ## Honest caveats
 
 - The 6-fold model AUC (`~0.54`) is only a small edge. At 5-minute frequency,
@@ -146,6 +170,9 @@ the narrow Jan–Jun 2026 forward window.
 | `output/BTCUSDT/adaptive_2026H1/comparison.json` | Same comparison in report dir |
 | `output/BTCUSDT/adaptive_full_oos.json` | Full-OOS adaptive vs fixed A/B (2021-11 → 2026-06) |
 | `output/BTCUSDT/adaptive_2026H1/COMPARISON.md` | Human-readable comparison + full-OOS sanity check |
+| `output/BTCUSDT/COMPARISON_2026H1.html` / `.md` | Full H1 2026 comparison incl. Jesse TEMA strategy |
+| `output/BTCUSDT/tema_trend_2026H1/report.json` | TEMA as-authored + normalised results |
+| `output/BTCUSDT/tema_trend_2026H1/trades_*.csv` | TEMA trade logs |
 
 ## Reproduce
 
@@ -159,4 +186,7 @@ python scripts/research_full.py --folds 6 --n-est 350 --sweep-rows 120000
 # adaptive MFE/MAE comparison (6-fold, sweep ≤2025-12-31, strict forward 2026 H1)
 python scripts/adaptive_tp_sl.py --folds 6 --n-est 300 \
   --select-end 2025-12-31 --start 2026-01-01 --end 2026-06-30 --min-trades-adapt 25
+
+# Jesse TEMA trend-following comparison (H1 2026, as-authored + normalised)
+python scripts/backtest_tema_trend.py
 ```
