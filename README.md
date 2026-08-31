@@ -85,8 +85,8 @@ If you need to refresh or extend it, use `scripts/download_binance_data.py`:
 python scripts/download_binance_data.py --symbol BTCUSDT --start 2021-01 --end 2026-06
 ```
 
-The parser is pair-agnostic: if the config symbol changes (e.g. to BNBUSDT) and
-`Dataset_BNBUSDT/` exists, it will load that automatically.
+The parser will read any Binance Vision symbol directory automatically when the
+config symbol changes (e.g. from BTCUSDT to another Binance Vision symbol).
 
 ---
 
@@ -132,7 +132,7 @@ The framework is deliberately conservative:
 | `tp_bps` | 50.0 | ~0.50% target |
 | `sl_bps` | 20.0 | ~0.20% stop |
 | `scalp_bars` | 12 | hold at most 12 × 5m = 60m |
-| `taker_fee_bps` | 4.0 | Binance Futures taker w/ BNB discount |
+| `taker_fee_bps` | 4.0 | Binance Futures taker fee |
 | `slippage_bps` | 1.0 | per side |
 | `probability_threshold` | 0.60 | probability must be at least 0.60 |
 | `probability_margin` | 0.12 | and |P(up)−P(down)| must be ≥ 0.12 |

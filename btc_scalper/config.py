@@ -59,7 +59,7 @@ class Config:
     initial_capital: float = 10_000.0
     risk_pct: float = 0.01              # 1% of equity risked per trade
     notional_pct_cap: float = 1.0       # cap position at 100% of equity (no leverage)
-    taker_fee_bps: float = 4.0          # Binance Futures taker fee w/ BNB discount
+    taker_fee_bps: float = 4.0          # Binance Futures taker fee (default rate)
     slippage_bps: float = 1.0           # per-side assumed slippage
     max_hold_bars: int = 12             # aligned with scalp_bars
     cooldown_bars: int = 2              # bars to wait after an exit before re-entry

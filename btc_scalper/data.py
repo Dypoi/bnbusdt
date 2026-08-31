@@ -7,9 +7,9 @@ format. Each ZIP contains one CSV with 12 columns and NO header:
     close_time, quote_volume, number_of_trades,
     taker_buy_base_volume, taker_buy_quote_volume, ignore
 
-This module loads that exact format for BTCUSDT (or any symbol/interval), so
-the same parser also works for a ``Dataset_BNBUSDT/`` folder if the pair ever
-changes.
+This module loads the exact format for the configured Binance Vision kline
+archive (BTCUSDT by default) and works for any symbol/interval directory that
+uses the same structure.
 """
 from __future__ import annotations
 
